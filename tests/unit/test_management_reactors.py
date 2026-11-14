@@ -4,12 +4,15 @@ import asyncio
 import importlib
 from concurrent.futures import CancelledError, Future
 from threading import Event, Thread, current_thread, get_ident
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from cassandra import DependencyException
 from cassandra._management import (
-    ManagementRuntime, ReactorChannel, execution_context)
+    ManagementContextError, ManagementRuntime, ReactorChannel, execution_context)
+from cassandra.cluster import Cluster, Session
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +43,7 @@ def connection_class(request):
                             'asyncore': 'AsyncoreConnection'}[request.param])
 
 
-def test_idle_reactor_completion_runs_on_io_thread(connection_class):
+def test_idle_reactor_completion_and_raw_io_sync_guard(connection_class):
     channel = ReactorChannel(connection_class)
     for _ in range(3):
         finished = Event()
@@ -48,6 +51,17 @@ def test_idle_reactor_completion_runs_on_io_thread(connection_class):
         def on_io():
             assert execution_context() is None  # Ordinary ResponseFuture context.
             assert connection_class._management_in_context()
+            cluster = SimpleNamespace(connection_class=connection_class,
+                                      _lifecycle=None, control_connection=Mock())
+            session = SimpleNamespace(cluster=cluster, execute=Mock())
+            for call in (lambda: Cluster.connect(cluster),
+                         lambda: Cluster.refresh_nodes(cluster),
+                         lambda: Cluster.refresh_schema_metadata(cluster),
+                         lambda: Session.set_keyspace(session, 'ks')):
+                with pytest.raises(ManagementContextError):
+                    call()
+            cluster.control_connection.assert_not_called()
+            session.execute.assert_not_called()
             observations.append(get_ident())
             finished.set()
         channel.dispatch(on_io)
@@ -707,3 +721,34 @@ def test_fork_reinitialization_closes_inherited_descriptors(monkeypatch, reactor
         peer.close()
         os.close(read_fd)
         os.waitpid(pid, 0)
+
+
+def test_channel_startup_failure_unwinds_all_management_threads():
+    from cassandra._lifecycle import LifecycleCoordinator
+    class FailingConnection:
+        @classmethod
+        def initialize_reactor(cls):
+            pass
+        @classmethod
+        def _management_in_context(cls):
+            return False
+        @classmethod
+        def _management_dispatch(cls, callback):
+            raise RuntimeError('bridge admission failed')
+    cluster = SimpleNamespace(connection_class=FailingConnection, is_shutdown=False)
+    # SimpleNamespace is not weak-referenceable; use an ordinary test lifetime.
+    class Lifetime:
+        pass
+    lifetime = Lifetime()
+    lifetime.connection_class = FailingConnection
+    lifetime.is_shutdown = False
+    coordinator = LifecycleCoordinator(lifetime)
+    import threading
+    before = {thread.ident for thread in threading.enumerate()
+              if thread.name.startswith('cassandra-management-')}
+    with pytest.raises(RuntimeError, match='bridge admission failed'):
+        coordinator._ensure_runtime()
+    assert coordinator._runtime is None
+    after = {thread.ident for thread in threading.enumerate()
+             if thread.name.startswith('cassandra-management-')}
+    assert after == before

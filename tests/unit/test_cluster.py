@@ -2731,7 +2731,7 @@ cluster = Cluster(
     allow_control_connection_query_fallback=
     ControlConnectionQueryFallback.SkipPoolCreation,
 )
-with patch.object(cluster.connection_class, 'initialize_reactor'), \
+with patch.object(cluster.connection_class, 'initialize_reactor', wraps=cluster.connection_class.initialize_reactor), \
         patch.object(cluster.control_connection, 'connect'), \
         patch.object(cluster, '_populate_hosts'), \
         patch.object(cluster.profile_manager, 'check_supported'):
@@ -2792,7 +2792,7 @@ cluster = Cluster(
     allow_control_connection_query_fallback=
     ControlConnectionQueryFallback.SkipPoolCreation,
 )
-with patch.object(cluster.connection_class, 'initialize_reactor'), \
+with patch.object(cluster.connection_class, 'initialize_reactor', wraps=cluster.connection_class.initialize_reactor), \
         patch.object(cluster.control_connection, 'connect'), \
         patch.object(cluster, '_populate_hosts'), \
         patch.object(cluster.profile_manager, 'check_supported'):
@@ -4130,7 +4130,7 @@ class SessionPoolRaceTest(unittest.TestCase):
         cluster.sessions = (session, live_session)
         cluster._finalize_add = Mock()
 
-        def collect_futures(futures, callback):
+        def collect_futures(futures, callback, host=None):
             callback([future.exception(timeout=5) or future.result(timeout=5)
                       for future in futures])
 
@@ -6692,7 +6692,7 @@ class _ResumableConnection(Connection):
     supports_tls_session_resumption = True
 
 
-class _NonResumableConnection(Connection):
+class _NonResumableConnection(connection_class):
     supports_tls_session_resumption = False
 
 

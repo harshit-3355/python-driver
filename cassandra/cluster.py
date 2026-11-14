@@ -690,6 +690,7 @@ class ProfileManager(object):
             for n in names
         )
 
+    @_lifecycle.policy_call
     def distance(self, host):
         if not self.pools_allowed:
             return HostDistance.IGNORED
@@ -699,14 +700,17 @@ class ProfileManager(object):
             HostDistance.REMOTE if HostDistance.REMOTE in distances else \
             HostDistance.IGNORED
 
+    @_lifecycle.policy_call
     def populate(self, cluster, hosts):
         for p in self.profiles.values():
             p.load_balancing_policy.populate(cluster, hosts)
 
+    @_lifecycle.policy_call
     def check_supported(self):
         for p in self.profiles.values():
             p.load_balancing_policy.check_supported()
 
+    @_lifecycle.policy_call
     def on_up(self, host):
         if not self.pools_allowed:
             return
@@ -715,6 +719,7 @@ class ProfileManager(object):
                 return
             p.load_balancing_policy.on_up(host)
 
+    @_lifecycle.policy_call
     def on_down(self, host):
         if not self.pools_allowed:
             return
@@ -723,12 +728,14 @@ class ProfileManager(object):
             if host._is_removed:
                 return
 
+    @_lifecycle.policy_call
     def on_add(self, host):
         for p in self.profiles.values():
             if host._is_removed:
                 return
             p.load_balancing_policy.on_add(host)
 
+    @_lifecycle.policy_call
     def on_remove(self, host):
         for p in self.profiles.values():
             p.load_balancing_policy.on_remove(host)
@@ -1764,6 +1771,10 @@ class Cluster(object):
             schema_metadata_enabled, token_metadata_enabled,
             schema_meta_page_size=schema_metadata_page_size)
 
+    @staticmethod
+    def _management_start_allowed():
+        return not _cluster_scheduler_shutdown_started
+
     def _resolve_hostnames(self):
         raw_contact_points = []
         for cp in [cp for cp in self.contact_points if not isinstance(cp, EndPoint)]:
@@ -2084,6 +2095,7 @@ class Cluster(object):
                     "https://python-driver.docs.scylladb.com/stable/api/cassandra/cluster.html#cassandra.cluster.Cluster.protocol_version", self.protocol_version, new_version, host_endpoint)
         self.protocol_version = new_version
 
+    @_lifecycle.policy_call
     def _populate_hosts(self):
         self.profile_manager.populate(
             weakref.proxy(self), self.metadata.all_hosts())
@@ -2091,6 +2103,7 @@ class Cluster(object):
             weakref.proxy(self), self.metadata.all_hosts()
         )
 
+    @_lifecycle.synchronous_api
     def connect(self, keyspace=None, wait_for_all_pools=False):
         """
         Creates and returns a new :class:`~.Session` object.
@@ -2102,6 +2115,7 @@ class Cluster(object):
         established or attempted. Default is `False`, which means it will return when the first
         successful connection is established. Remaining pools are added asynchronously.
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         reject_late_connect = False
         shutdown_rejected_cluster = False
         with self._lock:
@@ -2207,6 +2221,14 @@ class Cluster(object):
             else:
                 self.is_shutdown = True
 
+        if _lifecycle.managed_context(self):
+            try:
+                self._shutdown_future = _lifecycle.defer_cleanup(
+                    self, partial(self._shutdown, wait_for_executor=False))
+            finally:
+                self._lifecycle.close()
+            return
+
         # Once interpreter scheduler cleanup has begun, executor teardown is
         # imminent and this call may itself be running on an executor worker.
         self._shutdown(
@@ -2216,7 +2238,7 @@ class Cluster(object):
         """Finish cleanup after shutdown has been claimed under ``self._lock``."""
 
         self._lifecycle.close()
-        if self._lifecycle.delivering:
+        if self._lifecycle.delivering or _lifecycle.execution_context() is not None:
             wait_for_executor = False
 
         if self._idle_heartbeat:
@@ -2385,12 +2407,12 @@ class Cluster(object):
             if futures:
                 self._lifecycle.collect_futures(
                     futures, partial(self._on_up_pools_completed, host,
-                                     generation=generation))
+                                     generation=generation), host=host)
         except Exception:
             log.exception("Unexpected failure handling node %s being marked up:", host)
             for future in futures:
                 future.cancel()
-
+            self._on_up_preparation_failed(host, generation)
             raise
         else:
             if not futures:
@@ -2471,7 +2493,7 @@ class Cluster(object):
         return reconnector
 
     @run_in_executor
-    @_lifecycle.event
+    @_lifecycle.negative_event
     def on_down_potentially_blocking(self, host, is_host_addition,
                                      down_event_generation,
                                      on_add_reconnection=None):
@@ -2843,9 +2865,9 @@ class Cluster(object):
                                addition_token=addition_token)
             return
 
-        self._lifecycle.collect_futures(futures, pools_completed)
+        self._lifecycle.collect_futures(futures, pools_completed, host=host)
 
-    @_lifecycle.event
+    @_lifecycle.observation_event('readiness')
     def _finalize_add(self, host, set_up=True, generation=None,
                       addition_token=None, advance_health=True):
         if not self._lifecycle.mark_ready(
@@ -3135,6 +3157,7 @@ class Cluster(object):
         connection = self.control_connection._connection
         return self.control_connection._get_host_for_connection(connection)
 
+    @_lifecycle.synchronous_api
     def refresh_schema_metadata(self, max_schema_agreement_wait=None):
         """
         Synchronously refresh all schema metadata.
@@ -3148,9 +3171,11 @@ class Cluster(object):
 
         An Exception is raised if schema refresh fails for any reason.
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_schema(schema_agreement_wait=max_schema_agreement_wait, force=True):
             raise DriverException("Schema metadata was not refreshed. See log for details.")
 
+    @_lifecycle.synchronous_api
     def refresh_keyspace_metadata(self, keyspace, max_schema_agreement_wait=None):
         """
         Synchronously refresh keyspace metadata. This applies to keyspace-level information such as replication
@@ -3158,10 +3183,12 @@ class Cluster(object):
 
         See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_schema(target_type=SchemaTargetType.KEYSPACE, keyspace=keyspace,
                                                       schema_agreement_wait=max_schema_agreement_wait, force=True):
             raise DriverException("Keyspace metadata was not refreshed. See log for details.")
 
+    @_lifecycle.synchronous_api
     def refresh_table_metadata(self, keyspace, table, max_schema_agreement_wait=None):
         """
         Synchronously refresh table metadata. This applies to a table, and any triggers or indexes attached
@@ -3169,30 +3196,36 @@ class Cluster(object):
 
         See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_schema(target_type=SchemaTargetType.TABLE, keyspace=keyspace, table=table,
                                                       schema_agreement_wait=max_schema_agreement_wait, force=True):
             raise DriverException("Table metadata was not refreshed. See log for details.")
 
+    @_lifecycle.synchronous_api
     def refresh_materialized_view_metadata(self, keyspace, view, max_schema_agreement_wait=None):
         """
         Synchronously refresh materialized view metadata.
 
         See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_schema(target_type=SchemaTargetType.TABLE, keyspace=keyspace, table=view,
                                                       schema_agreement_wait=max_schema_agreement_wait, force=True):
             raise DriverException("View metadata was not refreshed. See log for details.")
 
+    @_lifecycle.synchronous_api
     def refresh_user_type_metadata(self, keyspace, user_type, max_schema_agreement_wait=None):
         """
         Synchronously refresh user defined type metadata.
 
         See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_schema(target_type=SchemaTargetType.TYPE, keyspace=keyspace, type=user_type,
                                                       schema_agreement_wait=max_schema_agreement_wait, force=True):
             raise DriverException("User Type metadata was not refreshed. See log for details.")
 
+    @_lifecycle.synchronous_api
     def refresh_user_function_metadata(self, keyspace, function, max_schema_agreement_wait=None):
         """
         Synchronously refresh user defined function metadata.
@@ -3201,10 +3234,12 @@ class Cluster(object):
 
         See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_schema(target_type=SchemaTargetType.FUNCTION, keyspace=keyspace, function=function,
                                                       schema_agreement_wait=max_schema_agreement_wait, force=True):
             raise DriverException("User Function metadata was not refreshed. See log for details.")
 
+    @_lifecycle.synchronous_api
     def refresh_user_aggregate_metadata(self, keyspace, aggregate, max_schema_agreement_wait=None):
         """
         Synchronously refresh user defined aggregate metadata.
@@ -3213,10 +3248,12 @@ class Cluster(object):
 
         See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_schema(target_type=SchemaTargetType.AGGREGATE, keyspace=keyspace, aggregate=aggregate,
                                                       schema_agreement_wait=max_schema_agreement_wait, force=True):
             raise DriverException("User Aggregate metadata was not refreshed. See log for details.")
 
+    @_lifecycle.synchronous_api
     def refresh_nodes(self, force_token_rebuild=False):
         """
         Synchronously publish refreshed node-list and token metadata.
@@ -3231,6 +3268,7 @@ class Cluster(object):
 
         An Exception is raised if node refresh fails for any reason.
         """
+        _lifecycle.assert_synchronous_api(self.connection_class)
         if not self.control_connection.refresh_node_list_and_token_map(force_token_rebuild):
             raise DriverException("Node list was not refreshed. See log for details.")
 
@@ -3561,12 +3599,15 @@ class Session(object):
     _pool_generations = None
     _pool_intents = None
     _pool_creation_work = None
+    # Bare Session.__new__ fixtures have no admitted runtime lifetime.
+    _management_runtime = None
     _profile_manager = None
     _metrics = None
     _request_init_callbacks = None
 
     def __init__(self, cluster, hosts, keyspace=None):
         self.cluster = cluster
+        self._management_runtime = cluster._lifecycle._ensure_runtime()
         self.hosts = hosts
         self.keyspace = keyspace
 
@@ -4233,11 +4274,20 @@ class Session(object):
                     for future in initial_connect_futures
                     if future in pool_creation_work)
 
+        cleanup = partial(self._finish_shutdown, initial_connect_work,
+                          initial_connect_futures)
+        if (_lifecycle.managed_context(self.cluster) and
+                not _lifecycle.performing_cleanup()):
+            self._shutdown_future = _lifecycle.defer_cleanup(self.cluster, cleanup)
+            return
+        cleanup()
+
+    def _finish_shutdown(self, initial_connect_work, initial_connect_futures):
         # PYTHON-673. If shutdown was called shortly after session init, avoid
         # a race by cancelling any initial connection attempts haven't started,
         # then blocking on any that have.
         for future in initial_connect_work:
-            future.cancel()
+            _cancel_and_notify(future)
         wait_futures(initial_connect_work)
 
         for future in initial_connect_futures:
@@ -4284,21 +4334,25 @@ class Session(object):
         return pool_intents
 
     def _submit_pool_creation_work(self, completion, fn, *args, **kwargs):
-        """Submit pool creation and retain its work behind its public proxy."""
-        with self._lock:
-            work_future = self.submit(fn, *args, **kwargs)
-            add_done_callback = (
-                getattr(work_future, 'add_done_callback', None)
-                if work_future is not None else None)
-            if callable(add_done_callback):
-                work = self._pool_creation_work
-                if work is None:
-                    work = self._pool_creation_work = {}
-                work[completion] = work_future
+        """Retain one charged physical result behind each legacy pool proxy."""
+        def work():
+            with _lifecycle.physical_work_context():
+                return fn(*args, **kwargs)
 
-        if callable(add_done_callback):
-            add_done_callback(partial(
-                self._pool_creation_work_done, completion))
+        with _lifecycle.compatibility_work(self._management_runtime) as attach:
+            with self._lock:
+                work_future = self.submit(work)
+                add_done_callback = (
+                    getattr(work_future, 'add_done_callback', None)
+                    if work_future is not None else None)
+                if callable(add_done_callback):
+                    work_items = self._pool_creation_work
+                    if work_items is None:
+                        work_items = self._pool_creation_work = {}
+                    work_items[completion] = work_future
+            attach(work_future)
+            if callable(add_done_callback):
+                add_done_callback(partial(self._pool_creation_work_done, completion))
         return work_future
 
     def _pool_creation_work_done(self, completion, work_future):
@@ -5064,6 +5118,7 @@ class Session(object):
         else:
             self.remove_pool(host)
 
+    @_lifecycle.synchronous_api
     def set_keyspace(self, keyspace):
         """
         Set the default keyspace for all queries made through this Session.
@@ -5073,6 +5128,7 @@ class Session(object):
         :class:`.InvalidRequest` if another Session is using the shared
         connection or another keyspace change is in progress.
         """
+        _lifecycle.assert_synchronous_api(self.cluster.connection_class)
         self.execute('USE %s' % (protect_name(keyspace),))
 
     def _set_keyspace_for_all_pools(self, keyspace, callback):

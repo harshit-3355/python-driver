@@ -728,18 +728,31 @@ class ManagementRuntime:
                 receive(None, exc)
         return _PENDING
 
-    def notify(self, callback, *, wait=False, timeout=None, budget='ordinary'):
+    def notify(self, callback, *, wait=False, timeout=None, budget='ordinary',
+               ready=None):
+        """Admit FIFO delivery, optionally gated by a caller publication batch.
+
+        A gate is scheduler state: handlers never wait on the submitting
+        thread. Release it through ``release_notifications`` after publication.
+        """
         self._check_pid()
         def admit(record):
             with self._condition:
                 if self._closing or record.handler_done or record.released:
                     return _PENDING
                 record.notification = True
-                self._notifications.append((record, callback))
+                self._notifications.append((record, callback, ready))
                 self._condition.notify_all()
             return _PENDING
         return self.submit(admit, wait=wait, timeout=timeout, budget=budget,
                            kind='notification')
+
+    def release_notifications(self, gates):
+        self._check_pid()
+        with self._condition:
+            for gate in gates:
+                gate.set()
+            self._condition.notify_all()
 
     @contextmanager
     def synchronous_reentry(self):
@@ -1047,11 +1060,14 @@ class ManagementRuntime:
     def _run_notifications(self):
         while True:
             with self._condition:
-                while not self._notifications and not self._closing:
+                while (not self._closing and
+                       (not self._notifications or
+                        (self._notifications[0][2] is not None and
+                         not self._notifications[0][2].is_set()))):
                     self._condition.wait()
                 if self._closing:
                     return
-                record, callback = self._notifications.popleft()
+                record, callback, ready = self._notifications.popleft()
             with _entered('callback', record):
                 try:
                     value = callback()
@@ -1066,7 +1082,7 @@ class ManagementRuntime:
                     with self._condition:
                         record.notification = False
                         self._release_locked(record)
-            record = callback = value = None
+            record = callback = ready = value = None
 
     def retain_cleanup(self):
         """Retain one cleanup obligation independently of load."""
@@ -1097,7 +1113,7 @@ class ManagementRuntime:
                 for record in tuple(self._records):
                     self._finish(record, error=ManagementClosed(
                         'Management lifetime ended'))
-                for record, _ in self._notifications:
+                for record, _, _ in self._notifications:
                     record.notification = False
                     self._release_locked(record)
                 self._notifications.clear()
