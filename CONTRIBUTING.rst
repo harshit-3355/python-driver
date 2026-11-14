@@ -27,6 +27,15 @@ Design and Implementation Guidelines
 - Legacy ``cqlengine`` has varying degrees of overreaching client-side validation. Going forward, we will avoid client validation where server feedback is adequate and not overly expensive.
 - When writing tests, try to achieve maximal coverage in unit tests (where it is faster to run across many runtimes). Integration tests are good for things where we need to test server interaction, or where it is important to test across different server versions (emulating in unit tests would not be effective).
 
+Manager architecture
+--------------------
+The `cluster and pool manager ownership contract <MANAGER_OWNERSHIP.rst>`_
+records the proposed internal architecture, migration stages, regression
+coverage and validation budgets for lifecycle changes. The workloads, budgets
+and measurement procedure require recorded agreement before runtime
+implementation. The contract describes a development target rather than
+released runtime behavior.
+
 Optional NumPy imports
 ----------------------
 Ordinary driver imports must not import NumPy, even when it is installed.
@@ -195,7 +204,8 @@ when the working tree has changes; use ``--worktree`` to plan those changes.
 Selection follows these rules:
 
 * Documentation/support-only changes select no driver tests. This includes
-  ``docs/``, Markdown files, ``CONTRIBUTING.rst``, ``CHANGELOG.rst``, ``LICENSE``,
+  ``docs/``, Markdown files, ``CONTRIBUTING.rst``,
+  ``CHANGELOG.rst``, ``LICENSE``,
   ``.gitignore``, ``.gitattributes``, ``.github/dependabot.yml``, and the two
   documentation workflows. Applicable docs builds and release-note
   classification continue.
